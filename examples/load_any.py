@@ -32,24 +32,6 @@ from open_clip import IMAGENET_CLASSNAMES, OPENAI_IMAGENET_TEMPLATES
 from common import collate, round_up, get_standard_transform, get_rank, get_world_size, rank_print, load_model
 
 
-class MixedCosineL1Loss(nn.Module):
-    def __init__(self, alpha, beta):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.cos_criterion = nn.CosineEmbeddingLoss()
-        self.smooth_l1_criterion = nn.SmoothL1Loss()
-
-    def forward(self, y1: torch.Tensor, y2: torch.Tensor):
-        y1 = y1.reshape(y1.shape[0], -1)
-        y2 = y2.reshape(y2.shape[0], -1)
-
-        target = torch.ones(y1.shape[0], device=y1.device)
-
-        return self.alpha * self.cos_criterion(y1, y2, target) * self.beta * self.smooth_l1_criterion(y1, y2)
-
-
-
 def main(rank: int = 0, world_size: int = 1):
     local_rank = rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
@@ -68,17 +50,17 @@ def main(rank: int = 0, world_size: int = 1):
                              ' If not specified, center cropped 378px is used.'
                              ' Default: The RADIO model\'s preferred resolution.'
     )
-    parser.add_argument('-d', '--dataset', default='zh-plus/tiny-imagenet',
+    parser.add_argument('-d', '--dataset', default='imagenet-1k',
                         help='The name of the dataset to classify'
     )
-    parser.add_argument('--split', default='train',
+    parser.add_argument('--split', default='valid',
                         help='The dataset split to use.'
     )
     parser.add_argument('--resize-multiple', type=int, default=16,
                         help='Resize images with dimensions a multiple of this value.'
                              ' This should be equal to the patch size of a ViT (e.g. RADIOv1)'
     )
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=1024,
                         help='The batch size. If the input is variable sized, then this argument becomes a maximum.'
     )
     parser.add_argument('-w', '--workers', default=8, type=int,
@@ -102,25 +84,12 @@ def main(rank: int = 0, world_size: int = 1):
 
     args, _ = parser.parse_known_args()
 
-    summary_c = MixedCosineL1Loss(1, 0)
-    feature_c = MixedCosineL1Loss(0.9, 0.1)
     rank_print('Loading model...')
-    
-    model_radio, preprocessor_radio, info_radio = load_model('radio_v2.5-l', adaptor_names=['clip','dino_v2'], return_spatial_features=False,
-                                           vitdet_window_size=None, force_reload=False,
-                                           torchhub_repo="NVlabs/RADIO")
-    model_dino, preprocessor_dino, info_dino = load_model('dinov2_vitg14_reg', adaptor_names=None, return_spatial_features=False,
-                                           vitdet_window_size=None, force_reload=False,
-                                           torchhub_repo="NVlabs/RADIO")
-    model_clip, preprocessor_clip, info_clip = load_model('open_clip,ViT-H-14-378-quickgelu,dfn5b', adaptor_names=None, return_spatial_features=False,
-                                           vitdet_window_size=None, force_reload=False,
-                                           torchhub_repo="NVlabs/RADIO")
-    model_radio.to(device=device).train()
-    model_dino.to(device=device).eval()
-    model_clip.to(device=device).eval()
-
-    opt = torch.optim.Adam(model_radio.parameters())
-
+    adaptor_names = args.adaptor_name.split(',') if args.adaptor_name is not None else None
+    model, preprocessor, info = load_model(args.model_version, adaptor_names=adaptor_names, return_spatial_features=False,
+                                           vitdet_window_size=args.vitdet_window_size, force_reload=args.force_reload,
+                                           torchhub_repo=args.torchhub_repo)
+    model.to(device=device).eval()
     # print(f"test random weight: {model.model.state_dict()['blocks.0.attn.qkv.weight']}")
     rank_print('Done')
 
@@ -129,14 +98,18 @@ def main(rank: int = 0, world_size: int = 1):
     ds_builder.download_and_prepare()
     num_examples = min(ds_builder.info.splits[args.split].num_examples, 1000000)
 
-    transform_radio = get_standard_transform((432,432), 16, preprocessor=preprocessor_radio)
-    transform_dino = get_standard_transform((224,224), 14, preprocessor=preprocessor_dino)
-    transform_clip = get_standard_transform((378,378), 14, preprocessor=preprocessor_clip)
+    if args.resolution is None:
+        args.resolution = (model.preferred_resolution[0], model.preferred_resolution[1])
+
+    if args.resize_multiple is None:
+        args.resize_multiple = getattr(model, 'min_resolution_step', model.patch_size)
+
+    transform = get_standard_transform(args.resolution, args.resize_multiple, preprocessor=preprocessor)
     dataset = ds_builder.as_dataset(split=args.split)
     dataset = dataset.to_iterable_dataset(num_shards=world_size * max(1, args.workers))
     dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
     dataset = dataset.shuffle(42)
-    dataset = dataset.map(lambda ex: dict(image=transform_radio(ex['image']), label=torch.as_tensor(ex['label'], dtype=torch.int64)))
+    dataset = dataset.map(lambda ex: dict(image=transform(ex['image']), label=torch.as_tensor(ex['label'], dtype=torch.int64)))
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, collate_fn=collate,
@@ -147,38 +120,37 @@ def main(rank: int = 0, world_size: int = 1):
     rank_print(f'Description: {ds_builder.info.description}')
 
     num_processed = 0
-    with tqdm(total=num_examples, disable=rank > 0) as t:
+    with torch.no_grad(), tqdm(total=num_examples, disable=rank > 0) as t:
         for batches in loader:
             for images, targets in batches:
-                images_dino = transform_dino(images)
-                images_clip = transform_clip(images)
                 images = images.to(device=device, non_blocking=True)
-                images_dino = images_dino.to(device=device, non_blocking=True)
-                images_clip = images_clip.to(device=device, non_blocking=True)
                 targets = targets.to(device=device, non_blocking=True)
                 # print(f"input image shape: {images.shape}, targets shape: {targets.shape}")
 
-                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=False):
-                    student = model_radio(images)
-                    student_dino = student['dino_v2']
-                    student_clip = student['clip']
-                    with torch.no_grad():
-                        teacher_dino = model_dino(images_dino)
-                        teacher_clip = model_clip(images_clip)
-
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.amp):
+                    output = model(images)
+                    if args.adaptor_name:
+                        output = output[args.adaptor_name]
                     # print(f"summary shape: {output[0].shape}")
                     # print(f"feature shape: {output[1].shape}")
+                    # all_feats.append(features)
 
-                    loss = summary_c(student_dino[0], teacher_dino[0]) + summary_c(student_clip[0] + teacher_clip[0]) + feature_c(student_dino[1], teacher_dino[1]) + feature_c(student_clip[1] + teacher_clip[1])
+                    # cov_samples += features.shape[0]
 
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
+                    # sample_mean_feats = features.sum(dim=0, dtype=torch.float64)
+                    # if mean_feats is None:
+                    #     mean_feats = sample_mean_feats
+                    # else:
+                    #     mean_feats += sample_mean_feats
 
+                    # curr_mean = mean_feats / cov_samples
+                    # zc_features = (features - curr_mean).double()
 
-
-
-
+                    # outer = zc_features.T @ zc_features
+                    # if cov_feats is None:
+                    #     cov_feats = outer.double()
+                    # else:
+                    #     cov_feats += outer.double()
 
             num_processed += world_size * args.batch_size
 
@@ -186,6 +158,8 @@ def main(rank: int = 0, world_size: int = 1):
             if num_processed >= num_examples:
                 break
 
+    del model
+    del preprocessor
 
 
 if __name__ == '__main__':

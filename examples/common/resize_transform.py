@@ -62,6 +62,7 @@ class ResizeTransform(transforms.Transform):
             inpt = inpt.convert('RGB')
 
         size = params['size']
+        print(f"real interpolate size is:{size}")
 
         return transforms.functional.resize(inpt, size=size, interpolation=transforms.InterpolationMode.BICUBIC)
 
