@@ -19,6 +19,14 @@ def collate(samples: List[Dict[str, torch.Tensor]], group: bool = True):
             s['image']
             for s in samples
         ]
+        images_d = [
+            s['image_dino']
+            for s in samples
+        ]
+        images_c = [
+            s['image_clip']
+            for s in samples
+        ]
         labels = [
             s['label']
             for s in samples
@@ -28,14 +36,16 @@ def collate(samples: List[Dict[str, torch.Tensor]], group: bool = True):
         labels = [torch.as_tensor(s[1]) for s in samples]
 
     if group:
-        size_groups = defaultdict(lambda: [[],[]])
-        for im, lab in zip(images, labels):
+        size_groups = defaultdict(lambda: [[],[],[],[]])
+        for im, im_d, im_c, lab in zip(images, images_d, images_c, labels):
             grp = size_groups[im.shape]
             grp[0].append(im)
-            grp[1].append(lab)
+            grp[1].append(im_d)
+            grp[2].append(im_c)
+            grp[3].append(lab)
 
         ret = [
-            (torch.stack(g[0]), torch.stack(g[1]))
+            (torch.stack(g[0]), torch.stack(g[1]), torch.stack(g[2]), torch.stack(g[3]))
             for g in size_groups.values()
         ]
     else:
